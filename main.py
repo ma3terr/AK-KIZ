@@ -4,7 +4,7 @@ import time
 from io import BytesIO
 from PIL import Image
 import fitz # PyMuPDF
-import json # New import for handling JSON from Telegram
+import json 
 
 import telebot
 from google import genai
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------- Environment / Config ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-API_KEY_FILE = os.environ.get("API_KEY_FILE") # optional firebase credentials file path
+API_KEY_FILE = os.environ.get("API_KEY_FILE")
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE") # e.g. "https://my-app.up.railway.app"
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "6082991135")
 TEMP_DIR = "temp"
@@ -46,13 +46,11 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 db = None
 try:
     if API_KEY_FILE:
-        # Assuming API_KEY_FILE points to a service account JSON path
         cred = credentials.Certificate(API_KEY_FILE)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
         logger.info("Initialized Firebase Admin with credentials file.")
     else:
-        # Fallback to default credentials (e.g., if running on Google Cloud)
         if not firebase_admin._apps:
             firebase_admin.initialize_app()
         db = firestore.client()
@@ -72,7 +70,7 @@ if GEMINI_API_KEY:
         client = None
 
 # ---------- Telebot ----------
-# The path must be unique for security, we use the token itself.
+# مسیر وب هوک در Flask همیشه باید ریشه /BOT_TOKEN باشد
 WEBHOOK_URL_PATH = f"/{BOT_TOKEN}" 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='MARKDOWN')
 logger.info("TeleBot instance created.")
@@ -132,14 +130,12 @@ def process_file_part(file_path, mime_type):
     if 'image' in mime_type:
         try:
             img = Image.open(file_path)
-            # You might need to resize if the image is too large for the API
             return types.Part.from_image(img)
         except Exception as e:
             logger.error(f"process image error: {e}")
             return None
     if 'pdf' in mime_type:
         try:
-            # Extract the first page as an image (as designed by you)
             doc = fitz.open(file_path)
             page = doc.load_page(0)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -161,10 +157,7 @@ def get_gemini_response(user_id, user_prompt, file_part=None):
     chat = get_session_history(user_id)
     if chat is None:
         return "خطا در ایجاد سشن چت."
-
-    # This is handled inside get_session_history now
-    # chat_sessions[user_id] = chat 
-
+    
     contents = []
     if file_part:
         contents.append(file_part)
@@ -210,9 +203,8 @@ def handle_text(message):
 def handle_multimedia(message):
     user_id = message.chat.id
     
-    # 1. Determine file type and get file ID
     if message.content_type == 'photo':
-        file_id = message.photo[-1].file_id # Get the highest resolution photo
+        file_id = message.photo[-1].file_id 
         mime_type = 'image/jpeg' 
         caption = message.caption
     elif message.content_type == 'document':
@@ -224,12 +216,10 @@ def handle_multimedia(message):
 
     logger.info(f"Received file (ID: {file_id}, Type: {mime_type}) from {user_id}")
 
-    # Check for unsupported file types
     if 'image' not in mime_type and 'pdf' not in mime_type:
         bot.reply_to(message, "فقط فایل‌های تصویری (JPEG, PNG) و PDF پشتیبانی می‌شوند.")
         return
 
-    # 2. Download the file
     file_info = bot.get_file(file_id)
     downloaded_file = bot.download_file(file_info.file_path)
     temp_file_path = os.path.join(TEMP_DIR, f"{file_id}.{mime_type.split('/')[-1]}")
@@ -238,13 +228,11 @@ def handle_multimedia(message):
         with open(temp_file_path, 'wb') as new_file:
             new_file.write(downloaded_file)
 
-        # 3. Process the file (convert PDF to image or load image)
         file_part = process_file_part(temp_file_path, mime_type)
         if file_part is None:
              bot.reply_to(message, "خطا در پردازش فایل: فایل قابل خواندن نیست یا فرمت پشتیبانی نمی‌شود.")
              return
 
-        # 4. Get response from Gemini
         bot.send_chat_action(user_id, 'typing')
         response_text = get_gemini_response(user_id, caption or "این فایل/عکس را تحلیل کن.", file_part)
         bot.send_message(user_id, response_text)
@@ -253,14 +241,14 @@ def handle_multimedia(message):
         logger.error(f"Error handling multimedia message: {e}")
         bot.send_message(user_id, "متأسفانه در پردازش فایل خطایی رخ داد.")
     finally:
-        # 5. Cleanup temp file
         if os.path.exists(temp_file_path):
              os.remove(temp_file_path)
 
 
-# ---------- Flask App & Webhook Setup (بخش جدید برای راه‌اندازی سرور) ----------
+# ---------- Flask App & Webhook Setup (تغییر در نحوه تعریف مسیر و اجرای Flask) ----------
 app = Flask(__name__)
 
+# مسیر وب‌هوک باید دقیقا با آدرسی که در تلگرام ثبت می‌شود، یکسان باشد.
 @app.route(WEBHOOK_URL_PATH, methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -269,11 +257,12 @@ def webhook():
         bot.process_new_updates([update])
         return '!', 200
     else:
-        abort(403)
+        # این خطا 403 به تلگرام اطلاع می‌دهد که درخواست نامعتبر است
+        abort(403) 
 
+# این مسیر برای تست ساده است و نباید پیام تلگرام دریافت کند
 @app.route('/')
 def index():
-    # This route is mainly for checking if the app is alive
     return "Telegram Bot is running and awaiting webhook calls.", 200
 
 # Function to set up the webhook
@@ -282,12 +271,13 @@ def setup_webhook():
         logger.error("WEBHOOK_BASE is not set. Cannot set webhook.")
         return
 
-    webhook_url = WEBHOOK_BASE + WEBHOOK_URL_PATH
+    # Webhook URL باید شامل مسیر کامل (توکن) باشد که توسط Flask هندل می‌شود
+    webhook_url = WEBHOOK_BASE + WEBHOOK_URL_PATH 
     logger.info(f"Attempting to set webhook to: {webhook_url}")
     
     try:
-        bot.remove_webhook() # Remove any previous webhook
-        time.sleep(1) # Wait a second
+        bot.remove_webhook()
+        time.sleep(1)
         if bot.set_webhook(url=webhook_url):
             logger.info(f"Webhook set successfully to {webhook_url}")
         else:
@@ -296,12 +286,12 @@ def setup_webhook():
         logger.error(f"Failed to set webhook: {e}")
         
 if __name__ == '__main__':
-    # 1. Setup Webhook (this needs to be done once)
     setup_webhook()
     
-    # 2. Start the Flask server
-    # Railway environment sets the PORT environment variable
-    port = int(os.environ.get('PORT', 5000)) 
+    # پورت را از محیط می‌خوانیم، که در Railway به طور خودکار تنظیم می‌شود.
+    # پورت پیش‌فرض Railway معمولاً 8080 است.
+    port = int(os.environ.get('PORT', 8080)) 
     logger.info(f"Starting Flask server on port {port}...")
-    # host='0.0.0.0' is required for Railway to expose the port correctly
+    
+    # host='0.0.0.0' برای Railway اجباری است.
     app.run(host='0.0.0.0', port=port)
