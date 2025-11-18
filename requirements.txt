@@ -1,10 +1,6 @@
-python-telegram-bot
+pytelegrambotapi
 google-genai
 Pillow
 PyMuPDF
 Flask
 firebase-admin
-fitz
-flask
-pytelegrambotapi
-sift-stack-py
