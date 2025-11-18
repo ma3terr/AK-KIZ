@@ -1,176 +1,297 @@
 import os
-import sys
-import telebot
-from flask import Flask, request
 import logging
-from google import genai
+import time
 from io import BytesIO
 from PIL import Image
+import fitz # PyMuPDF
+import json 
 
-# --- تنظیمات و لاگینگ ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import telebot
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
 
-# --- متغیرهای محیطی ---
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-API_KEY_GEMINI = os.environ.get('API_KEY_GEMINI')
+from flask import Flask, request, abort
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Environment / Config ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+API_KEY_FILE = os.environ.get("API_KEY_FILE")
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE") # e.g. "https://my-app.up.railway.app"
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "6082991135")
+TEMP_DIR = "temp"
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-flash-preview-09-2025")
 
 if not BOT_TOKEN:
-    logging.error("❌ BOT_TOKEN محیطی تنظیم نشده است. برنامه متوقف می‌شود.")
-    sys.exit(1)
+    logger.error("BOT_TOKEN is not set. Exiting.")
+    raise SystemExit("BOT_TOKEN env var required")
 
-if not API_KEY_GEMINI:
-    logging.error("❌ API_KEY_GEMINI محیطی تنظیم نشده است. ربات تنها به پیام‌های متنی ساده پاسخ خواهد داد.")
-    gemini_enabled = False
-else:
-    gemini_enabled = True
-    try:
-        # پیکربندی کلاینت جمینای
-        gemini_client = genai.Client(api_key=API_KEY_GEMINI)
-        MODEL_NAME = 'gemini-2.5-flash'
-        logging.info("⭐ کلاینت Gemini با موفقیت راه‌اندازی شد.")
-    except Exception as e:
-        logging.error(f"❌ خطای راه‌اندازی Gemini Client: {e}")
-        gemini_enabled = False
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY is not set. Gemini calls will fail.")
 
-# --- راه‌اندازی ربات و وب‌سرور ---
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# ---------- Create temp dir ----------
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-# --- مسیر وب‌هوک Flask ---
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        try:
-            json_string = request.get_data().decode('utf-8')
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-        except Exception as e:
-            # این خطاها شامل کرش‌های ناگهانی در حین process_new_updates یا خطای JSON هستند
-            logging.error(f"⚠️ خطای پردازش به‌روزرسانی (احتمالاً کرش): {e}", exc_info=True)
-        return "OK", 200
+# ---------- Firebase init (optional) ----------
+db = None
+try:
+    if API_KEY_FILE:
+        cred = credentials.Certificate(API_KEY_FILE)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("Initialized Firebase Admin with credentials file.")
     else:
-        logging.warning("درخواست غیر JSON دریافت شد.")
-        return "Invalid Content Type", 403
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        db = firestore.client()
+        logger.info("Initialized Firebase Admin (default).")
+except Exception as e:
+    logger.warning(f"Firebase init failed or not provided: {e}")
+    db = None
 
-# --- هندلرهای پیام ---
+# ---------- Gemini client ----------
+client = None
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("Gemini client initialized.")
+    except Exception as e:
+        logger.error(f"Failed to init Gemini client: {e}")
+        client = None
+
+# ---------- Telebot ----------
+# مسیر وب هوک در Flask همیشه باید ریشه /BOT_TOKEN باشد
+WEBHOOK_URL_PATH = f"/{BOT_TOKEN}" 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='MARKDOWN')
+logger.info("TeleBot instance created.")
+
+# in-memory session fallback (Used if Firestore fails)
+chat_sessions = {}
+last_interaction_time = {}
+
+# ---------- Helpers: Firebase session storage (Your original functions) ----------
+def get_session_history(user_id):
+    if client is None:
+        logger.warning("Gemini client not initialized.")
+        return None
+
+    if db:
+        try:
+            doc = db.collection('user_chats').document(str(user_id)).get()
+            if doc.exists:
+                data = doc.to_dict()
+                history_data = data.get('history', [])
+                contents = []
+                for item in history_data:
+                    contents.append(types.Content(role=item['role'],
+                                                  parts=[types.Part.from_text(item['text'])]))
+                return client.chats.create(model=MODEL_NAME, history=contents)
+        except Exception as e:
+            logger.warning(f"Error loading session from Firestore: {e}")
+
+    # Fallback to in-memory/new session creation
+    if user_id in chat_sessions:
+        return chat_sessions[user_id]
+    try:
+        return client.chats.create(model=MODEL_NAME) if client else None
+    except Exception as e:
+        logger.error(f"Failed creating new Gemini chat session: {e}")
+        return None
+
+def save_session_history(user_id, chat):
+    if not db:
+        chat_sessions[user_id] = chat # Save to in-memory if no Firestore
+        return
+    try:
+        history = []
+        for message in getattr(chat, "history", []):
+            # Only save text parts for simplicity
+            if len(message.parts) == 1 and getattr(message.parts[0], "text", None):
+                history.append({'role': message.role, 'text': message.parts[0].text})
+        db.collection('user_chats').document(str(user_id)).set({
+            'history': history,
+            'last_update': firestore.SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        logger.warning(f"Failed saving session to Firestore: {e}")
+
+# ---------- File processing (Your original function) ----------
+def process_file_part(file_path, mime_type):
+    if 'image' in mime_type:
+        try:
+            img = Image.open(file_path)
+            return types.Part.from_image(img)
+        except Exception as e:
+            logger.error(f"process image error: {e}")
+            return None
+    if 'pdf' in mime_type:
+        try:
+            doc = fitz.open(file_path)
+            page = doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            temp_img = os.path.join(TEMP_DIR, f"pdf_preview_{os.path.basename(file_path)}.png")
+            pix.save(temp_img)
+            doc.close()
+            img = Image.open(temp_img)
+            return types.Part.from_image(img)
+        except Exception as e:
+            logger.error(f"process pdf error: {e}")
+            return None
+    return None
+
+# ---------- Gemini interaction (Your original function) ----------
+def get_gemini_response(user_id, user_prompt, file_part=None):
+    if client is None:
+        return "اتصال به Gemini برقرار نیست. GEMINI_API_KEY را بررسی کنید."
+
+    chat = get_session_history(user_id)
+    if chat is None:
+        return "خطا در ایجاد سشن چت."
+    
+    contents = []
+    if file_part:
+        contents.append(file_part)
+    if user_prompt:
+        contents.append(user_prompt)
+
+    if not contents:
+        return "هیچ ورودی‌ای ارسال نشده."
+
+    try:
+        response = chat.send_message(contents)
+        save_session_history(user_id, chat)
+        return getattr(response, "text", str(response))
+    except APIError as e:
+        logger.error(f"Gemini APIError: {e}")
+        return "خطای API گوگل: لطفاً بعداً تلاش کنید."
+    except Exception as e:
+        logger.error(f"Gemini unexpected error: {e}")
+        return "خطای داخلی در پردازش درخواست."
+
+# ---------- Telebot Handlers (برنامه‌های پاسخ‌دهنده به پیام‌ها) ----------
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    status_msg = "فعال" if gemini_enabled else "غیرفعال (API_KEY_GEMINI موجود نیست)"
-    response_text = f"""
-سلام! من یک ربات تحلیلگر تصویر هستم.
-وضعیت Gemini: **{status_msg}**
+    bot.reply_to(message, 
+                 "سلام! من یک ربات هوش مصنوعی هستم که با Gemini کار می‌کنم. \n\n"
+                 "شما می‌توانید هر سوالی بپرسید یا عکس و فایل PDF بفرستید تا آن‌ها را تحلیل کنم.\n\n"
+                 "برای شروع کافیست یک پیام بفرستید!")
 
-شما می‌توانید:
-1. **یک تصویر** بفرستید. من آن را با Gemini تحلیل می‌کنم و توضیحات کاملی می‌دهم.
-2. **یک تصویر** به همراه **متن** (caption) بفرستید. من تصویر را بر اساس دستورالعمل متنی شما تحلیل می‌کنم.
-3. فقط **پیام متنی** بفرستید.
-
-**توجه:** اگر ربات به پیام تصویری پاسخ نداد، لطفاً لاگ‌های Railway را بررسی کنید.
-"""
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    logger.info(f"Received text from {message.chat.id}")
+    user_id = message.chat.id
     try:
-        bot.reply_to(message, response_text, parse_mode="Markdown")
-        logging.info(f"✅ پاسخ به /start برای کاربر {message.from_user.id}")
+        bot.send_chat_action(user_id, 'typing')
+        response_text = get_gemini_response(user_id, message.text)
+        bot.send_message(user_id, response_text)
     except Exception as e:
-        logging.error(f"❌ خطای پاسخ به /start: {e}", exc_info=True)
+        logger.error(f"Error handling text message: {e}")
+        bot.send_message(user_id, "متأسفانه در پردازش پیام خطایی رخ داد.")
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    if not gemini_enabled:
-        bot.reply_to(message, "❗️ متأسفم، کلید API جمینای تنظیم نشده است. نمی‌توانم تصاویر را پردازش کنم.")
+@bot.message_handler(content_types=['photo', 'document'])
+def handle_multimedia(message):
+    user_id = message.chat.id
+    
+    if message.content_type == 'photo':
+        file_id = message.photo[-1].file_id 
+        mime_type = 'image/jpeg' 
+        caption = message.caption
+    elif message.content_type == 'document':
+        file_id = message.document.file_id
+        mime_type = message.document.mime_type or 'application/octet-stream'
+        caption = message.caption
+    else:
         return
 
-    # 1. گرفتن بهترین کیفیت عکس
-    file_id = message.photo[-1].file_id
-    prompt = message.caption if message.caption else "تصویر را با جزئیات کامل و به زبان فارسی تحلیل کن و توضیح بده."
+    logger.info(f"Received file (ID: {file_id}, Type: {mime_type}) from {user_id}")
 
-    bot.send_chat_action(message.chat.id, 'typing')
+    if 'image' not in mime_type and 'pdf' not in mime_type:
+        bot.reply_to(message, "فقط فایل‌های تصویری (JPEG, PNG) و PDF پشتیبانی می‌شوند.")
+        return
+
+    file_info = bot.get_file(file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    temp_file_path = os.path.join(TEMP_DIR, f"{file_id}.{mime_type.split('/')[-1]}")
     
     try:
-        # 2. گرفتن اطلاعات فایل و دانلود آن
-        file_info = bot.get_file(file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        
-        # 3. تبدیل به فرمت PIL Image
-        image_stream = BytesIO(downloaded_file)
-        pil_image = Image.open(image_stream)
-        
-        # 4. آماده‌سازی محتوا برای Gemini
-        contents = [prompt, pil_image]
-        
-        logging.info(f"💫 ارسال تصویر به Gemini با پرامپت: '{prompt[:50]}...'")
-        
-        # 5. فراخوانی API Gemini
-        response = gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents
-        )
-        
-        # 6. ارسال پاسخ
-        bot.reply_to(message, response.text)
-        logging.info(f"✅ پاسخ Gemini با موفقیت برای کاربر {message.from_user.id} ارسال شد.")
-        
-    except telebot.apihelper.ApiTelegramException as e:
-        error_msg = f"❗️ خطای تلگرام در دانلود یا ارسال پاسخ: {e}"
-        logging.error(error_msg, exc_info=True)
-        bot.reply_to(message, f"❌ خطای اتصال تلگرام (Telegram API Error):\n`{str(e)}`")
-        
-    except genai.errors.APIError as e:
-        error_msg = f"❗️ خطای API Gemini: {e}"
-        logging.error(error_msg, exc_info=True)
-        bot.reply_to(message, f"❌ خطای جمینای (Gemini API Error):\n`{str(e)}`")
+        with open(temp_file_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+
+        file_part = process_file_part(temp_file_path, mime_type)
+        if file_part is None:
+             bot.reply_to(message, "خطا در پردازش فایل: فایل قابل خواندن نیست یا فرمت پشتیبانی نمی‌شود.")
+             return
+
+        bot.send_chat_action(user_id, 'typing')
+        response_text = get_gemini_response(user_id, caption or "این فایل/عکس را تحلیل کن.", file_part)
+        bot.send_message(user_id, response_text)
 
     except Exception as e:
-        # پوشش هرگونه خطای ناشناخته (مثل خطای PIL، کمبود حافظه، ...)
-        error_msg = f"❗️ خطای ناشناخته در پردازش تصویر: {e}"
-        logging.error(error_msg, exc_info=True)
-        bot.reply_to(message, f"❌ متأسفم، خطایی در پردازش رخ داد. لطفاً لاگ‌های Railway را بررسی کنید. (خطا: {type(e).__name__})")
-
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def handle_text(message):
-    try:
-        if gemini_enabled:
-            # اگر فقط متن بود، می‌توانیم از Gemini برای چت معمولی استفاده کنیم
-            bot.send_chat_action(message.chat.id, 'typing')
-            
-            logging.info(f"💫 ارسال پیام متنی به Gemini برای کاربر {message.from_user.id}")
-            response = gemini_client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[message.text]
-            )
-            bot.reply_to(message, response.text)
-            logging.info("✅ پاسخ متنی Gemini ارسال شد.")
-        else:
-            # در صورت عدم وجود کلید API
-            response_text = "پیام متنی شما دریافت شد. کلید API جمینای تنظیم نشده است، بنابراین فقط پاسخ ساده می‌دهم."
-            bot.reply_to(message, response_text)
-            
-    except genai.errors.APIError as e:
-        error_msg = f"❗️ خطای API Gemini در حالت متنی: {e}"
-        logging.error(error_msg, exc_info=True)
-        bot.reply_to(message, f"❌ خطای جمینای در پاسخ متنی:\n`{str(e)}`")
-
-    except Exception as e:
-        error_msg = f"❌ خطای عمومی در پاسخ متنی: {e}"
-        logging.error(error_msg, exc_info=True)
-        bot.reply_to(message, "❌ متأسفم، خطایی در پاسخ متنی رخ داد.")
+        logger.error(f"Error handling multimedia message: {e}")
+        bot.send_message(user_id, "متأسفانه در پردازش فایل خطایی رخ داد.")
+    finally:
+        if os.path.exists(temp_file_path):
+             os.remove(temp_file_path)
 
 
-# --- اجرای وب‌سرور ---
-if __name__ == "__main__":
-    WEBHOOK_URL_BASE = os.environ.get('WEBHOOK_BASE')
-    WEBHOOK_URL_PATH = f'/{BOT_TOKEN}'
+# ---------- Flask App & Webhook Setup (تغییر در نحوه تعریف مسیر و اجرای Flask) ----------
+app = Flask(__name__)
 
-    if WEBHOOK_URL_BASE:
-        full_webhook_url = f"{WEBHOOK_URL_BASE.rstrip('/')}{WEBHOOK_URL_PATH}"
-        try:
-            bot.set_webhook(url=full_webhook_url)
-            logging.info(f"⭐ وب‌هوک با موفقیت تنظیم شد: {full_webhook_url}")
-        except Exception as e:
-            logging.error(f"❌ خطای تنظیم وب‌هوک: {e}", exc_info=True)
+# مسیر وب‌هوک باید دقیقا با آدرسی که در تلگرام ثبت می‌شود، یکسان باشد.
+@app.route(WEBHOOK_URL_PATH, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '!', 200
     else:
-        logging.warning("⚠️ متغیر WEBHOOK_BASE تنظیم نشده است. ربات ممکن است به‌روزرسانی‌ها را دریافت نکند.")
+        # این خطا 403 به تلگرام اطلاع می‌دهد که درخواست نامعتبر است
+        abort(403) 
+
+# این مسیر برای تست ساده است و نباید پیام تلگرام دریافت کند
+@app.route('/')
+def index():
+    return "Telegram Bot is running and awaiting webhook calls.", 200
+
+# Function to set up the webhook
+def setup_webhook():
+    if not WEBHOOK_BASE:
+        logger.error("WEBHOOK_BASE is not set. Cannot set webhook.")
+        return
+
+    # Webhook URL باید شامل مسیر کامل (توکن) باشد که توسط Flask هندل می‌شود
+    webhook_url = WEBHOOK_BASE + WEBHOOK_URL_PATH 
+    logger.info(f"Attempting to set webhook to: {webhook_url}")
+    
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        if bot.set_webhook(url=webhook_url):
+            logger.info(f"Webhook set successfully to {webhook_url}")
+        else:
+            logger.error("Failed to set webhook (bot.set_webhook returned False)")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
         
-    port = int(os.environ.get('PORT', 8080))
-    logging.info(f"🚀 شروع برنامه Flask روی پورت {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == '__main__':
+    setup_webhook()
+    
+    # پورت را از محیط می‌خوانیم، که در Railway به طور خودکار تنظیم می‌شود.
+    # پورت پیش‌فرض Railway معمولاً 8080 است.
+    port = int(os.environ.get('PORT', 8080)) 
+    logger.info(f"Starting Flask server on port {port}...")
+    
+    # host='0.0.0.0' برای Railway اجباری است.
+    app.run(host='0.0.0.0', port=port)
