@@ -40,8 +40,7 @@ if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY is not set. Gemini calls will fail.")
 
 # ---------- Create temp dir ----------
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ---------- Firebase init (optional) ----------
 db = None
@@ -70,7 +69,7 @@ if GEMINI_API_KEY:
         logger.error(f"Failed to init Gemini client: {e}")
         client = None
 
-# ---------- Telebot (pytelegrambotapi) ----------
+# ---------- Telebot ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='MARKDOWN')
 logger.info("TeleBot instance created.")
 
@@ -84,7 +83,6 @@ def get_session_history(user_id):
         logger.warning("Gemini client not initialized.")
         return None
 
-    # Try firestore
     if db:
         try:
             doc = db.collection('user_chats').document(str(user_id)).get()
@@ -93,14 +91,12 @@ def get_session_history(user_id):
                 history_data = data.get('history', [])
                 contents = []
                 for item in history_data:
-                    # item: {'role':..., 'text':...}
                     contents.append(types.Content(role=item['role'],
                                                   parts=[types.Part.from_text(item['text'])]))
                 return client.chats.create(model=MODEL_NAME, history=contents)
         except Exception as e:
             logger.warning(f"Error loading session from Firestore: {e}")
 
-    # fallback: in-memory or new
     if user_id in chat_sessions:
         return chat_sessions[user_id]
     try:
@@ -126,7 +122,6 @@ def save_session_history(user_id, chat):
 
 # ---------- File processing ----------
 def process_file_part(file_path, mime_type):
-    """Return types.Part (image) or None"""
     if 'image' in mime_type:
         try:
             img = Image.open(file_path)
@@ -172,7 +167,6 @@ def get_gemini_response(user_id, user_prompt, file_part=None):
     try:
         response = chat.send_message(contents)
         save_session_history(user_id, chat)
-        # response.text is convenient; fallback to str(response) if needed
         return getattr(response, "text", str(response))
     except APIError as e:
         logger.error(f"Gemini APIError: {e}")
@@ -181,84 +175,4 @@ def get_gemini_response(user_id, user_prompt, file_part=None):
         logger.error(f"Gemini unexpected error: {e}")
         return "خطای داخلی در پردازش درخواست."
 
-# ---------- Bot handlers (same as قبل, adjusted) ----------
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome = (
-        "سلام! من ربات شما هستم.\n\n"
-        "1. پیام متنی بفرستید.\n"
-        "2. عکس بفرستید تا تحلیل کنم.\n"
-        "3. PDF بفرستید تا صفحه اول را خلاصه کنم.\n\n"
-        "برای ریست کردن سشن: /reset"
-    )
-    bot.reply_to(message, welcome)
-
-@bot.message_handler(commands=['reset'])
-def reset_session(message):
-    user_id = message.chat.id
-    if user_id in chat_sessions:
-        del chat_sessions[user_id]
-    if db:
-        try:
-            db.collection('user_chats').document(str(user_id)).delete()
-        except Exception as e:
-            logger.warning(f"Couldn't delete Firestore history: {e}")
-    bot.reply_to(message, "تاریخچه شما پاک شد.")
-
-def safe_send(user_id, text):
-    try:
-        bot.send_message(user_id, text)
-    except Exception as e:
-        logger.warning(f"Failed sending message to {user_id}: {e}")
-
-@bot.message_handler(content_types=['text'])
-def handle_text_messages(message):
-    user_id = message.chat.id
-    if user_id in last_interaction_time and time.time() - last_interaction_time[user_id] < 1:
-        return
-    last_interaction_time[user_id] = time.time()
-    bot.send_chat_action(user_id, 'typing')
-    response = get_gemini_response(user_id, message.text)
-    safe_send(user_id, response)
-
-@bot.message_handler(content_types=['photo'])
-def handle_photo_messages(message):
-    user_id = message.chat.id
-    if not message.photo:
-        return
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        file_bytes = bot.download_file(file_info.file_path)
-        ext = os.path.splitext(file_info.file_path)[1] or ".jpg"
-        temp_path = os.path.join(TEMP_DIR, f"{user_id}_{int(time.time())}{ext}")
-        with open(temp_path, "wb") as f:
-            f.write(file_bytes)
-        image_part = process_file_part(temp_path, "image/jpeg")
-        prompt = message.caption if message.caption else "لطفاً این تصویر را تحلیل کن."
-        bot.send_chat_action(user_id, 'typing')
-        resp = get_gemini_response(user_id, prompt, file_part=image_part)
-        safe_send(user_id, resp)
-    except Exception as e:
-        logger.error(f"handle photo error: {e}")
-        safe_send(user_id, "خطا در پردازش تصویر.")
-    finally:
-        try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except Exception:
-            pass
-
-@bot.message_handler(content_types=['document'])
-def handle_document_messages(message):
-    user_id = message.chat.id
-    if not message.document:
-        return
-    mime = message.document.mime_type or ""
-    if 'pdf' not in mime:
-        safe_send(user_id, "فقط PDF پشتیبانی می‌شود.")
-        return
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
-        ext = os.path.splitext(file_info.file_path)[1] or ".pdf"
-        te
+#
