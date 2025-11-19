@@ -2,3 +2,4 @@ pytelegrambotapi
 google-genai
 Pillow
 Flask
+gunicorn
