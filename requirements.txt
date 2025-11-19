@@ -1,5 +1,4 @@
 pytelegrambotapi
 google-genai
 Pillow
-PyMuPDF
 Flask
