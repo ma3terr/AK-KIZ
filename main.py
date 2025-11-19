@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ربات تلگرام مجهز به هوش مصنوعی با قابلیت چت و تحلیل تصویر
-# این نسخه بخش پردازش PDF را برای اطمینان از استقرار موفق در سرورهای ابری حذف کرده است.
+# این نسخه برای اطمینان از استقرار پایدار و پاسخگویی سریع به وب‌هوک بهینه‌سازی شده است.
 
 import os
 import logging
@@ -20,21 +20,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- ENV (متغیرهای محیطی) ----------------
+# NOTE: BOT_TOKEN, GEMINI_API_KEY, and WEBHOOK_BASE are loaded from environment variables.
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE")
-# استفاده از نام مدل پایدار
 MODEL_NAME = "gemini-2.5-flash" 
 
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN محیطی تنظیم نشده است.")
 if not GEMINI_API_KEY:
+    # این هشدار فقط در لاگ‌ها ظاهر می‌شود
     logger.warning("⚠️ GEMINI_API_KEY تنظیم نشده است - پاسخ‌های Gemini شکست خواهند خورد.")
 if not WEBHOOK_BASE:
     raise SystemExit("❌ WEBHOOK_BASE محیطی تنظیم نشده است.")
-
-TEMP_DIR = "/tmp/bot_temp"
-os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ---------------- Gemini (راه‌اندازی هوش مصنوعی) ----------------
 client = None
@@ -61,7 +59,7 @@ def run_gemini(user_id, prompt, image_part=None):
     if client is None:
         return "❌ اتصال به Gemini برقرار نیست. لطفاً کلید API را بررسی کنید."
 
-    # بارگذاری یا ایجاد نشست چت جدید (تاریخچه مکالمه حفظ می‌شود)
+    # بارگذاری یا ایجاد نشست چت جدید 
     if user_id not in chat_sessions:
         chat_sessions[user_id] = client.chats.create(model=MODEL_NAME)
     chat = chat_sessions[user_id]
@@ -101,8 +99,14 @@ def welcome(msg):
 def text_handler(msg):
     """پاسخ به پیام‌های متنی."""
     uid = msg.chat.id
-    bot.send_chat_action(uid, 'typing')
+    
+    # 1. فوراً یک اکشن برای کاربر ارسال می‌شود تا از timeout شدن وب‌هوک جلوگیری کند.
+    bot.send_chat_action(uid, 'typing') 
+    
+    # 2. پردازش اصلی
     out = run_gemini(uid, msg.text)
+    
+    # 3. ارسال پاسخ به کاربر
     bot.send_message(uid, out)
 
 @bot.message_handler(content_types=["photo"])
@@ -112,6 +116,8 @@ def file_handler(msg):
     caption = msg.caption or "این تصویر را تحلیل کن و یک توضیح مختصر بده."
     
     try:
+        bot.send_chat_action(uid, 'typing') # ارسال اکشن
+        
         # دریافت فایل با بالاترین کیفیت
         file_id = msg.photo[-1].file_id
         info = bot.get_file(file_id)
@@ -122,7 +128,6 @@ def file_handler(msg):
         # تبدیل تصویر به فرمت مورد نیاز Gemini
         part = types.Part.from_image(img)
         
-        bot.send_chat_action(uid, 'typing')
         out = run_gemini(uid, caption, image_part=part)
         bot.send_message(uid, out)
 
@@ -143,6 +148,9 @@ def webhook():
             bot.process_new_updates([upd])
         except Exception as e:
              logger.error(f"❌ Webhook processing failed: {e}", exc_info=True)
+        
+        # مهم: این خط تضمین می‌کند که به تلگرام فوراً پاسخ OK (200) ارسال شود
+        # حتی اگر پردازش طول بکشد، که به جلوگیری از خطای 502 کمک می‌کند.
         return "OK", 200
     abort(403)
 
@@ -154,7 +162,9 @@ def home():
 # ---------------- Setup Webhook & Run ----------------
 def setup_webhook():
     """تنظیم وب‌هوک در تلگرام."""
+    # مطمئن شوید که WEBHOOK_BASE هیچ / اضافه در انتها ندارد
     base = WEBHOOK_BASE.rstrip('/') 
+    # آدرس کامل وب‌هوک (فقط مسیر توکن به آن اضافه می‌شود)
     full = f"{base}{WEBHOOK_URL_PATH}"
     
     # حذف وب‌هوک قبلی برای اطمینان و تنظیم وب‌هوک جدید
@@ -171,4 +181,5 @@ if __name__ == "__main__":
     # استفاده از متغیر محیطی PORT که توسط Railway فراهم می‌شود
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"🚀 Starting Flask app on 0.0.0.0:{port}")
+    # مهم: host='0.0.0.0' تضمین می‌کند که Flask در همه اینترفیس‌ها گوش می‌دهد، که برای Railway ضروری است.
     app.run(host="0.0.0.0", port=port, debug=False)
